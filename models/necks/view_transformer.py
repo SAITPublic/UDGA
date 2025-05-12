@@ -1,0 +1,1003 @@
+# Copyright (c) Phigent Robotics. All rights reserved.
+
+import torch
+import torch.nn as nn
+from mmcv.runner import BaseModule
+from ..builder import NECKS
+from mmdet3d.ops import bev_pool
+from mmcv.cnn import build_conv_layer
+from .. import builder
+
+from ..model_utils import SDF
+from mmdet3d.models.utils import Adapter
+from mmcv.cnn import build_norm_layer
+
+def gen_dx_bx(xbound, ybound, zbound):
+    dx = torch.Tensor([row[2] for row in [xbound, ybound, zbound]])
+    bx = torch.Tensor([row[0] + row[2]/2.0 for row in [xbound, ybound, zbound]])
+    nx = torch.Tensor([(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]])
+    return dx, bx, nx
+
+
+def cumsum_trick(x, geom_feats, ranks):
+    x = x.cumsum(0)
+    kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
+    kept[:-1] = (ranks[1:] != ranks[:-1])
+    x, geom_feats = x[kept], geom_feats[kept]
+    x = torch.cat((x[:1], x[1:] - x[:-1]))
+    return x, geom_feats
+
+
+class QuickCumsum(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, geom_feats, ranks):
+        x = x.cumsum(0)
+        kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
+        kept[:-1] = (ranks[1:] != ranks[:-1])
+
+        x, geom_feats = x[kept], geom_feats[kept]
+        x = torch.cat((x[:1], x[1:] - x[:-1]))
+
+        # save kept for backward
+        ctx.save_for_backward(kept)
+
+        # no gradient for geom_feats
+        ctx.mark_non_differentiable(geom_feats)
+
+        return x, geom_feats
+
+    @staticmethod
+    def backward(ctx, gradx, gradgeom):
+        kept, = ctx.saved_tensors
+        back = torch.cumsum(kept, 0)
+        back[kept] -= 1
+
+        val = gradx[back]
+
+        return val, None, None
+
+
+@NECKS.register_module()
+class ViewTransformerLiftSplatShoot(BaseModule):
+    def __init__(self, grid_config=None, data_config=None,
+                 numC_input=512, numC_Trans=64, downsample=16,
+                 accelerate=False, max_drop_point_rate=0.0, use_bev_pool=True, **kwargs):
+        super(ViewTransformerLiftSplatShoot, self).__init__()
+        if grid_config is None:
+            grid_config = {
+                'xbound': [-51.2, 51.2, 0.8],
+                'ybound': [-51.2, 51.2, 0.8],
+                'zbound': [-10.0, 10.0, 20.0],
+                'dbound': [1.0, 60.0, 1.0],}
+        self.grid_config = grid_config
+        dx, bx, nx = gen_dx_bx(self.grid_config['xbound'],
+                               self.grid_config['ybound'],
+                               self.grid_config['zbound'],
+                               )
+        self.dx = nn.Parameter(dx, requires_grad=False)
+        self.bx = nn.Parameter(bx, requires_grad=False)
+        self.nx = nn.Parameter(nx, requires_grad=False)
+
+        if data_config is None:
+            data_config = {'input_size': (256, 704)}
+        self.data_config = data_config
+        self.downsample = downsample
+
+        self.frustum = self.create_frustum()
+        self.D, _, _, _ = self.frustum.shape
+        self.numC_input = numC_input
+        self.numC_Trans = numC_Trans
+        self.depthnet = nn.Conv2d(self.numC_input, self.D + self.numC_Trans, kernel_size=1, padding=0)
+        self.geom_feats = None
+        self.accelerate = accelerate
+        self.max_drop_point_rate = max_drop_point_rate
+        self.use_bev_pool = use_bev_pool
+        
+
+    def get_depth_dist(self, x):
+        return x.softmax(dim=1)
+
+    def create_frustum(self):
+        # make grid in image plane
+        ogfH, ogfW = self.data_config['input_size']
+        fH, fW = ogfH // self.downsample, ogfW // self.downsample
+        ds = torch.arange(*self.grid_config['dbound'], dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
+        D, _, _ = ds.shape
+        xs = torch.linspace(0, ogfW - 1, fW, dtype=torch.float).view(1, 1, fW).expand(D, fH, fW)
+        ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
+
+        # D x H x W x 3
+        frustum = torch.stack((xs, ys, ds), -1)
+
+        return nn.Parameter(frustum, requires_grad=False)
+
+    def get_geometry(self, rots, trans, intrins, post_rots, post_trans, offset=None):
+        """Determine the (x,y,z) locations (in the ego frame)
+        of the points in the point cloud.
+        Returns B x N x D x H/downsample x W/downsample x 3
+        """
+        B, N, _ = trans.shape
+        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
+
+        if offset is not None:
+            _,D,H,W = offset.shape
+            points[:,:,:,:,:,2] = points[:,:,:,:,:,2]+offset.view(B,N,D,H,W)
+        points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+
+        # cam_to_ego
+        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
+                            points[:, :, :, :, :, 2:3]
+                            ), 5)
+        if intrins.shape[3]==4: # for KITTI
+            shift = intrins[:,:,:3,3]
+            points  = points - shift.view(B,N,1,1,1,3,1)
+            intrins = intrins[:,:,:3,:3]
+        combine = rots.matmul(torch.inverse(intrins))
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        points += trans.view(B, N, 1, 1, 1, 3)
+
+        # points_numpy = points.detach().cpu().numpy()
+        return points
+
+    def voxel_pooling(self, geom_feats, x):
+        # torch.Size([8, 6, 59, 16, 44, 3]) torch.Size([8, 6, 59, 16, 44, 64])
+
+        B, N, D, H, W, C = x.shape # 4, 6, 89, 24, 44, 64
+        Nprime = B * N * D * H * W
+        nx = self.nx.to(torch.long)
+        # flatten x
+        x = x.reshape(Nprime, C)
+
+        # flatten indices
+        geom_feats = ((geom_feats - (self.bx - self.dx / 2.)) / self.dx).long()
+        geom_feats = geom_feats.view(Nprime, 3)
+        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
+                                         device=x.device, dtype=torch.long) for ix in range(B)])
+        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+
+        # filter out points that are outside box
+        kept = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0]) \
+               & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
+               & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+        x = x[kept]
+        geom_feats = geom_feats[kept]
+        # torch.Size([1569329, 4]) torch.Size([1569329, 64])
+
+        if self.max_drop_point_rate > 0.0 and self.training:
+            drop_point_rate = torch.rand(1)*self.max_drop_point_rate
+            kept = torch.rand(x.shape[0])>drop_point_rate
+            x, geom_feats = x[kept], geom_feats[kept]
+
+        if self.use_bev_pool:
+            final = bev_pool(x, geom_feats, B, self.nx[2], self.nx[0], # torch.Size([8, 64, 1, 128, 128])
+                                   self.nx[1])
+            final = final.transpose(dim0=-2, dim1=-1) # torch.Size([8, 64, 1, 128, 128])
+        else:
+            # get tensors from the same voxel next to each other
+            ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B) \
+                    + geom_feats[:, 1] * (self.nx[2] * B) \
+                    + geom_feats[:, 2] * B \
+                    + geom_feats[:, 3]
+            sorts = ranks.argsort()
+            x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
+
+            # cumsum trick
+            x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
+
+            # griddify (B x C x Z x X x Y)
+            final = torch.zeros((B, C, nx[2], nx[1], nx[0]), device=x.device)
+            final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 1], geom_feats[:, 0]] = x
+        # collapse Z
+        final = torch.cat(final.unbind(dim=2), 1)
+
+        return final
+
+    def voxel_pooling_accelerated(self, rots, trans, intrins, post_rots, post_trans, x):
+        B, N, D, H, W, C = x.shape
+        Nprime = B * N * D * H * W
+        nx = self.nx.to(torch.long)
+        # flatten x
+        x = x.reshape(Nprime, C)
+        max = 300
+        # flatten indices
+        if self.geom_feats is None:
+            geom_feats = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            geom_feats = ((geom_feats - (self.bx - self.dx / 2.)) / self.dx).long()
+            geom_feats = geom_feats.view(Nprime, 3)
+            batch_ix = torch.cat([torch.full([Nprime // B, 1], ix,
+                                             device=x.device, dtype=torch.long) for ix in range(B)])
+            geom_feats = torch.cat((geom_feats, batch_ix), 1)
+
+            # filter out points that are outside box
+            kept1 = (geom_feats[:, 0] >= 0) & (geom_feats[:, 0] < self.nx[0]) \
+                    & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1]) \
+                    & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
+            idx = torch.range(0, x.shape[0] - 1, dtype=torch.long)
+            x = x[kept1]
+            idx = idx[kept1]
+            geom_feats = geom_feats[kept1]
+
+            # get tensors from the same voxel next to each other
+            ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B) \
+                    + geom_feats[:, 1] * (self.nx[2] * B) \
+                    + geom_feats[:, 2] * B \
+                    + geom_feats[:, 3]
+            sorts = ranks.argsort()
+            x, geom_feats, ranks, idx = x[sorts], geom_feats[sorts], ranks[sorts], idx[sorts]
+            repeat_id = torch.ones(geom_feats.shape[0], device=geom_feats.device, dtype=geom_feats.dtype)
+            curr = 0
+            repeat_id[0] = 0
+            curr_rank = ranks[0]
+
+            for i in range(1, ranks.shape[0]):
+                if curr_rank == ranks[i]:
+                    curr += 1
+                    repeat_id[i] = curr
+                else:
+                    curr_rank = ranks[i]
+                    curr = 0
+                    repeat_id[i] = curr
+            kept2 = repeat_id < max
+            repeat_id, geom_feats, x, idx = repeat_id[kept2], geom_feats[kept2], x[kept2], idx[kept2]
+
+            geom_feats = torch.cat([geom_feats, repeat_id.unsqueeze(-1)], dim=-1)
+            self.geom_feats = geom_feats
+            self.idx = idx
+        else:
+            geom_feats = self.geom_feats
+            idx = self.idx
+            x = x[idx]
+
+        # griddify (B x C x Z x X x Y)
+        final = torch.zeros((B, C, nx[2], nx[1], nx[0], max), device=x.device)
+        final[geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 1], geom_feats[:, 0], geom_feats[:, 4]] = x
+        final = final.sum(-1)
+        # collapse Z
+        final = torch.cat(final.unbind(dim=2), 1)
+
+        return final
+
+    def forward(self, input):
+        x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+        x = self.depthnet(x)
+        depth = self.get_depth_dist(x[:, :self.D])
+        img_feat = x[:, self.D:(self.D + self.numC_Trans)]
+
+        # Lift
+        volume = depth.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+        return bev_feat
+
+
+class SELikeModule(nn.Module):
+    def __init__(self, in_channel=512, feat_channel=256, intrinsic_channel=33):
+        super(SELikeModule, self).__init__()
+        self.input_conv = nn.Conv2d(in_channel, feat_channel, kernel_size=1, padding=0)
+        self.fc = nn.Sequential(
+            nn.BatchNorm1d(intrinsic_channel),
+            nn.Linear(intrinsic_channel, feat_channel),
+            nn.Sigmoid() )
+
+    def forward(self, x, cam_params):
+        x = self.input_conv(x)
+        b,c,_,_ = x.shape
+        y = self.fc(cam_params).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+@NECKS.register_module()
+class ViewTransformerLSSBEVDepth(ViewTransformerLiftSplatShoot):
+    def __init__(self, extra_depth_net, loss_depth_weight=0, se_config=dict(),
+                 dcn_config=dict(bias=True), **kwargs):
+        super(ViewTransformerLSSBEVDepth, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+
+        self.extra_depthnet = builder.build_backbone(extra_depth_net)
+        self.featnet = nn.Conv2d(self.numC_input,
+                                 self.numC_Trans,
+                                 kernel_size=1,
+                                 padding=0)
+        self.depthnet = nn.Conv2d(extra_depth_net['num_channels'][0],
+                                  self.D,
+                                  kernel_size=1,
+                                  padding=0)
+        self.dcn = nn.Sequential(*[build_conv_layer(dict(type='DCNv2',
+                                                        deform_groups=1),
+                                                   extra_depth_net['num_channels'][0],
+                                                   extra_depth_net['num_channels'][0],
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   dilation=1,
+                                                   **dcn_config),
+                                   nn.BatchNorm2d(extra_depth_net['num_channels'][0])
+                                  ])
+        self.se = SELikeModule(self.numC_input,
+                               feat_channel=extra_depth_net['num_channels'][0],
+                               **se_config)
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+
+        img_feat = self.featnet(x)
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params)
+        depth_feat = self.extra_depthnet(depth_feat)[0]
+        depth_feat = self.dcn(depth_feat)
+        depth_digit = self.depthnet(depth_feat) # torch.Size([48, 59, 16, 44])        
+        depth_prob = self.get_depth_dist(depth_digit) # torch.Size([48, 59, 16, 44])
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+
+
+@NECKS.register_module()
+class ViewTransformerLSSBEVDepth2Point(ViewTransformerLiftSplatShoot):
+    def __init__(self, extra_depth_net, loss_depth_weight=0, se_config=dict(),
+                 dcn_config=dict(bias=True), **kwargs):
+        super(ViewTransformerLSSBEVDepth2Point, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+
+        self.extra_depthnet = builder.build_backbone(extra_depth_net)
+        self.featnet = nn.Conv2d(self.numC_input,
+                                 self.numC_Trans,
+                                 kernel_size=1,
+                                 padding=0)
+        self.depthnet = nn.Conv2d(extra_depth_net['num_channels'][0],
+                                  self.D,
+                                  kernel_size=1,
+                                  padding=0)
+        self.dcn = nn.Sequential(*[build_conv_layer(dict(type='DCNv2',
+                                                        deform_groups=1),
+                                                   extra_depth_net['num_channels'][0],
+                                                   extra_depth_net['num_channels'][0],
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   dilation=1,
+                                                   **dcn_config),
+                                   nn.BatchNorm2d(extra_depth_net['num_channels'][0])
+                                  ])
+        self.se = SELikeModule(self.numC_input,
+                               feat_channel=extra_depth_net['num_channels'][0],
+                               **se_config)
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+
+        img_feat = self.featnet(x)
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params)
+        depth_feat = self.extra_depthnet(depth_feat)[0]
+        depth_feat = self.dcn(depth_feat)
+        depth_digit = self.depthnet(depth_feat)
+        depth_prob = self.get_depth_dist(depth_digit)
+
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+@NECKS.register_module()
+class ViewTransformerLiftSplatShoot_SSL(ViewTransformerLiftSplatShoot):
+    def __init__(self, extra_depth_net, loss_depth_weight=0, se_config=dict(),
+                 dcn_config=dict(bias=True), pixel_const=500, **kwargs):
+        super(ViewTransformerLiftSplatShoot_SSL, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+
+        self.extra_depthnet = builder.build_backbone(extra_depth_net)
+        self.featnet = nn.Conv2d(self.numC_input,
+                                 self.numC_Trans,
+                                 kernel_size=1,
+                                 padding=0)
+        self.depthnet = nn.Conv2d(extra_depth_net['num_channels'][0],
+                                  self.D,
+                                  kernel_size=1,
+                                  padding=0)
+        self.dcn = nn.Sequential(*[build_conv_layer(dict(type='DCNv2',
+                                                        deform_groups=1),
+                                                   extra_depth_net['num_channels'][0],
+                                                   extra_depth_net['num_channels'][0],
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   dilation=1,
+                                                   **dcn_config),
+                                   nn.BatchNorm2d(extra_depth_net['num_channels'][0])
+                                  ])
+
+        self.se = SELikeModule(self.numC_input,
+                               feat_channel=extra_depth_net['num_channels'][0],
+                               **se_config)
+        
+        self.pixel_const = pixel_const
+
+    def get_geometry(self, rots, trans, intrins, post_rots, post_trans, offset=None):
+        """Determine the (x,y,z) locations (in the ego frame)
+        of the points in the point cloud.
+        Returns B x N x D x H/downsample x W/downsample x 3
+        """
+        B, N, _ = trans.shape
+        
+        c = self.pixel_const
+        new_frustum = self.frustum
+        new_frustum = new_frustum.unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1, 1, 1)
+        new_intrins = torch.matmul(post_rots, intrins)
+        new_frustum[..., 2] = new_frustum[..., 2] / (c* torch.sqrt(1/torch.square(new_intrins[..., 0, 0]) \
+                            + 1/torch.square(new_intrins[..., 1, 1]))[..., None, None, None])
+
+        points = new_frustum - post_trans.view(B, N, 1, 1, 1, 3)
+        
+        if offset is not None:
+            _,D,H,W = offset.shape
+            points[:,:,:,:,:,2] = points[:,:,:,:,:,2]+offset.view(B,N,D,H,W)
+        points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+
+        # cam_to_ego
+        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
+                            points[:, :, :, :, :, 2:3]
+                            ), 5)
+        if intrins.shape[3]==4: # for KITTI
+            shift = intrins[:,:,:3,3]
+            points  = points - shift.view(B,N,1,1,1,3,1)
+            intrins = intrins[:,:,:3,:3]
+        combine = rots.matmul(torch.inverse(intrins))
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        points += trans.view(B, N, 1, 1, 1, 3)
+
+        # points_numpy = points.detach().cpu().numpy()
+        return points   
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+
+        img_feat = self.featnet(x)
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params)
+        depth_feat = self.extra_depthnet(depth_feat)[0]
+        depth_feat = self.dcn(depth_feat)
+        depth_digit = self.depthnet(depth_feat)
+        depth_prob = self.get_depth_dist(depth_digit)
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+
+@NECKS.register_module()
+class ViewTransformerLiftSplatShoot_SSLAdapter(ViewTransformerLiftSplatShoot_SSL):
+    def __init__(self, **kwargs):
+        super(ViewTransformerLiftSplatShoot_SSLAdapter, self).__init__(**kwargs)
+        
+        for param in self.featnet.parameters():
+            param.requires_grad = False
+        self.adapter_1 = Adapter(512,64,2)
+        for param in self.se.parameters():
+            param.requires_grad = False
+        self.adapter_2 = Adapter(512,256,4)
+        # for param in self.extra_depthnet.parameters():
+        #     param.requires_grad = False
+        self.adapter_3 = Adapter(256,256,2)
+        for param in self.dcn.parameters():
+            param.requires_grad = False
+        self.adapter_4 = Adapter(256,256)
+        for param in self.depthnet.parameters():
+            param.requires_grad = False        
+        self.adapter_5 = Adapter(256,89,2)
+        self.adapter_6 = Adapter(89,89,2)
+
+        self.adapter_7 = Adapter(89,89,2)
+        self.adapter_8 = Adapter(64,64,2)
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+
+        # x.shape: torch.Size([48, 512, 24, 44])
+        img_feat = self.featnet(x) + self. adapter_1(x)
+        # img_feat.shape: torch.Size([48, 64, 24, 44])
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params) + self.adapter_2(depth_feat)
+        # depth_feat.shape: torch.Size([48, 256, 24, 44])
+        depth_feat = self.extra_depthnet(depth_feat)[0] + self.adapter_3(depth_feat)
+        # depth_feat.shape:torch.Size([48, 256, 24, 44])
+        depth_feat = self.dcn(depth_feat) + self.adapter_4(depth_feat)
+        # depth_feat.shape: torch.Size([48, 256, 24, 44])
+        depth_digit = self.depthnet(depth_feat) + self.adapter_5(depth_feat)
+        # depth_digit.shape: torch.Size([48, 89, 24, 44])
+        depth_prob = self.get_depth_dist(depth_digit) + self.adapter_6(depth_digit)
+        # depth_prob.shape: torch.Size([48, 89, 24, 44])
+        
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+        # volume.shape: torch.Size([8, 6, 89, 24, 44, 64])
+        tmp = volume.view(B*N, self.D, H, W, self.numC_Trans).flatten(3)
+        tmp = self.adapter_7(tmp)
+        volume = volume + tmp.view(B, N, self.D, H, W, self.numC_Trans)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+        # bev_feat.shape: torch.Size([8, 64, 128, 128])
+        bev_feat = bev_feat + self.adapter_8(bev_feat)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+
+
+@NECKS.register_module()
+class ViewTransformerLiftSplatShoot_DD3D(ViewTransformerLiftSplatShoot):
+    def __init__(self, extra_depth_net, loss_depth_weight=0, se_config=dict(),
+                 dcn_config=dict(bias=True), pixel_const=500, **kwargs):
+        super(ViewTransformerLiftSplatShoot_DD3D, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+
+        self.extra_depthnet = builder.build_backbone(extra_depth_net)
+        self.featnet = nn.Conv2d(self.numC_input,
+                                 self.numC_Trans,
+                                 kernel_size=1,
+                                 padding=0)
+        self.depthnet = nn.Conv2d(extra_depth_net['num_channels'][0],
+                                  self.D,
+                                  kernel_size=1,
+                                  padding=0)
+        self.dcn = nn.Sequential(*[build_conv_layer(dict(type='DCNv2',
+                                                        deform_groups=1),
+                                                   extra_depth_net['num_channels'][0],
+                                                   extra_depth_net['num_channels'][0],
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   dilation=1,
+                                                   **dcn_config),
+                                   nn.BatchNorm2d(extra_depth_net['num_channels'][0])
+                                  ])
+        self.se = SELikeModule(self.numC_input,
+                               feat_channel=extra_depth_net['num_channels'][0],
+                               **se_config)
+        
+        self.pixel_const = pixel_const
+
+    def get_geometry(self, rots, trans, intrins, post_rots, post_trans, offset=None):
+        """Determine the (x,y,z) locations (in the ego frame)
+        of the points in the point cloud.
+        Returns B x N x D x H/downsample x W/downsample x 3
+        """
+        B, N, _ = trans.shape
+        
+        c = self.pixel_const
+        new_frustum = self.frustum
+        new_frustum = new_frustum.unsqueeze(0).unsqueeze(0).repeat(B, N, 1, 1, 1, 1)
+        new_intrins = torch.matmul(post_rots, intrins)
+        new_frustum[..., 2] = new_frustum[..., 2] / (c* torch.sqrt(1/torch.square(new_intrins[..., 0, 0]) \
+                            + 1/torch.square(new_intrins[..., 1, 1]))[..., None, None, None])
+
+        points = new_frustum - post_trans.view(B, N, 1, 1, 1, 3)
+        
+        if offset is not None:
+            _,D,H,W = offset.shape
+            points[:,:,:,:,:,2] = points[:,:,:,:,:,2]+offset.view(B,N,D,H,W)
+        points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
+
+        # cam_to_ego
+        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
+                            points[:, :, :, :, :, 2:3]
+                            ), 5)
+        if intrins.shape[3]==4: # for KITTI
+            shift = intrins[:,:,:3,3]
+            points  = points - shift.view(B,N,1,1,1,3,1)
+            intrins = intrins[:,:,:3,:3]
+        combine = rots.matmul(torch.inverse(intrins))
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        points += trans.view(B, N, 1, 1, 1, 3)
+
+        # points_numpy = points.detach().cpu().numpy()
+        return points
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+
+        img_feat = self.featnet(x)
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params)
+        depth_feat = self.extra_depthnet(depth_feat)[0]
+        depth_feat = self.dcn(depth_feat)
+        depth_digit = self.depthnet(depth_feat)
+        depth_prob = self.get_depth_dist(depth_digit)
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+
+def init_ssf_scale_shift(dim):
+    scale = nn.Parameter(torch.ones(dim))
+    shift = nn.Parameter(torch.zeros(dim))
+
+    nn.init.normal_(scale, mean=1, std=.02)
+    nn.init.normal_(shift, std=.02)
+
+    return scale, shift
+
+
+def ssf_ada(x, scale, shift):
+    assert scale.shape == shift.shape
+    if x.shape[-1] == scale.shape[0]:
+        return x * scale + shift
+    elif x.shape[1] == scale.shape[0]:
+        return x * scale.view(1, -1, 1, 1) + shift.view(1, -1, 1, 1)
+    else:
+        raise ValueError('the input tensor shape does not match the shape of the scale factor.')
+
+
+@NECKS.register_module()
+class ViewTransformerLSSBEVDepth_PEFT(ViewTransformerLiftSplatShoot):
+    def __init__(self, extra_depth_net, loss_depth_weight=0, se_config=dict(),
+                 dcn_config=dict(bias=True), **kwargs):
+        super(ViewTransformerLSSBEVDepth_PEFT, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+
+        self.extra_depthnet = builder.build_backbone(extra_depth_net)
+        self.featnet = nn.Conv2d(self.numC_input,
+                                 self.numC_Trans,
+                                 kernel_size=1,
+                                 padding=0)
+        self.depthnet = nn.Conv2d(extra_depth_net['num_channels'][0],
+                                  self.D,
+                                  kernel_size=1,
+                                  padding=0)
+        self.dcn = nn.Sequential(*[build_conv_layer(dict(type='DCNv2',
+                                                        deform_groups=1),
+                                                   extra_depth_net['num_channels'][0],
+                                                   extra_depth_net['num_channels'][0],
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   dilation=1,
+                                                   **dcn_config),
+                                   nn.BatchNorm2d(extra_depth_net['num_channels'][0])
+                                  ])
+        self.se = SELikeModule(self.numC_input,
+                               feat_channel=extra_depth_net['num_channels'][0],
+                               **se_config)
+
+        self.scale1, self.shift1 = init_ssf_scale_shift(512)
+        self.scale2, self.shift2 = init_ssf_scale_shift(64)
+        self.scale3, self.shift3 = init_ssf_scale_shift(256)
+        self.scale4, self.shift4 = init_ssf_scale_shift(256)
+        self.scale5, self.shift5 = init_ssf_scale_shift(256)
+        self.scale6, self.shift6 = init_ssf_scale_shift(64)
+
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W) # 512
+        x = ssf_ada(x, self.scale1, self.shift1)
+        
+        with torch.no_grad():
+            img_feat = self.featnet(x) # 64
+        img_feat = ssf_ada(img_feat, self.scale2, self.shift2)
+        
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        with torch.no_grad():
+            depth_feat = self.se(depth_feat, cam_params) # 256
+        depth_feat = ssf_ada(depth_feat, self.scale3, self.shift3)
+        with torch.no_grad():
+            depth_feat = self.extra_depthnet(depth_feat)[0] # 256
+        depth_feat = ssf_ada(depth_feat, self.scale4, self.shift4)
+        with torch.no_grad():
+            depth_feat = self.dcn(depth_feat) # 256
+        depth_feat = ssf_ada(depth_feat, self.scale5, self.shift5)
+        with torch.no_grad():
+            depth_digit = self.depthnet(depth_feat) 
+        depth_prob = self.get_depth_dist(depth_digit)
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2) # 64
+        
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+        
+        bev_feat = ssf_ada(bev_feat, self.scale6, self.shift6)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+
+
+@NECKS.register_module()
+class ViewTransformerLSSBEVDepth_Adapter(ViewTransformerLiftSplatShoot):
+    def __init__(self, extra_depth_net, loss_depth_weight=0, se_config=dict(),
+                 dcn_config=dict(bias=True), **kwargs):
+        super(ViewTransformerLSSBEVDepth_Adapter, self).__init__(**kwargs)
+        self.loss_depth_weight = loss_depth_weight
+
+        self.extra_depthnet = builder.build_backbone(extra_depth_net)
+        for param in self.extra_depthnet.parameters():
+            param.requries_grad = False
+        
+        self.adapter_2 = Adapter(256, 256)
+
+        self.featnet = nn.Conv2d(self.numC_input,
+                                 self.numC_Trans,
+                                 kernel_size=1,
+                                 padding=0)
+        for param in self.featnet.parameters():
+            param.requries_grad = False
+
+        self.depthnet = nn.Conv2d(extra_depth_net['num_channels'][0],
+                                  self.D,
+                                  kernel_size=1,
+                                  padding=0)
+        for param in self.depthnet.parameters():
+            param.requries_grad = False
+        self.adapter_4 = Adapter(extra_depth_net['num_channels'][0], self.D)
+        
+
+        self.dcn = nn.Sequential(*[build_conv_layer(dict(type='DCNv2',
+                                                        deform_groups=1),
+                                                   extra_depth_net['num_channels'][0],
+                                                   extra_depth_net['num_channels'][0],
+                                                   kernel_size=3,
+                                                   stride=1,
+                                                   padding=1,
+                                                   dilation=1,
+                                                   **dcn_config),
+                                   nn.BatchNorm2d(extra_depth_net['num_channels'][0])
+                                  ])
+        for param in self.dcn.parameters():
+            param.requries_grad = False
+        self.adapter_3 = Adapter(256, 256)
+
+        self.se = SELikeModule(self.numC_input,
+                               feat_channel=extra_depth_net['num_channels'][0],
+                               **se_config)
+        for param in self.se.parameters():
+            param.requries_grad = False
+        self.adapter_1 = Adapter(512, 256)
+
+
+    def forward(self, input):
+        if len(input) == 7:
+            x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        else:
+            x, rots, trans, intrins, post_rots, post_trans = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W) # 512
+        
+        img_feat = self.featnet(x) # 64
+        
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params) + self.adapter_1(depth_feat)
+        depth_feat = self.extra_depthnet(depth_feat)[0] + self.adapter_2(depth_feat)
+        depth_feat = self.dcn(depth_feat) + self.adapter_3(depth_feat)
+        depth_digit = self.depthnet(depth_feat) + self.adapter_4(depth_feat)
+        depth_prob = self.get_depth_dist(depth_digit)
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+
+        if len(input) == 7:
+            return bev_feat, depth_digit
+        else:
+            return bev_feat, None
+
+
+
+@NECKS.register_module()
+class ViewTransformerLiftSplatShoot_depthup(ViewTransformerLiftSplatShoot_SSL):
+    def __init__(self, extra_depth_net, **kwargs):
+        super(ViewTransformerLiftSplatShoot_depthup, self).__init__(extra_depth_net, **kwargs)    
+        self.up_depth_net = nn.Sequential(
+            nn.Upsample(scale_factor=4 , mode='bilinear', align_corners=True),
+            nn.Conv2d(extra_depth_net['num_channels'][0], extra_depth_net['num_channels'][0], kernel_size=3, padding=1, bias=False),
+            build_norm_layer(dict(type='BN'), extra_depth_net['num_channels'][0], postfix=0)[1],
+            nn.ReLU(inplace=True),
+            nn.Conv2d(extra_depth_net['num_channels'][0], self.D, kernel_size=1, padding=0),
+        )
+
+    def forward(self, input):
+        assert len(input) == 7
+        x, rots, trans, intrins, post_rots, post_trans, depth_gt = input
+        B, N, C, H, W = x.shape
+        x = x.view(B * N, C, H, W)
+
+        img_feat = self.featnet(x)
+        depth_feat = x
+
+        cam_params = torch.cat([intrins.reshape(B*N,-1),
+                               post_rots.reshape(B*N,-1),
+                               post_trans.reshape(B*N,-1),
+                               rots.reshape(B*N,-1),
+                               trans.reshape(B*N,-1)],dim=1)
+
+        depth_feat = self.se(depth_feat, cam_params)
+        depth_feat = self.extra_depthnet(depth_feat)[0]
+        depth_feat = self.dcn(depth_feat)
+        depth_digit = self.depthnet(depth_feat)
+        up_depth_digit = self.up_depth_net(depth_feat)
+        depth_prob = self.get_depth_dist(depth_digit)
+        
+        # Lift
+        volume = depth_prob.unsqueeze(1) * img_feat.unsqueeze(2)
+        volume = volume.view(B, N, self.numC_Trans, self.D, H, W)
+        volume = volume.permute(0, 1, 3, 4, 5, 2)
+
+        # Splat
+        if self.accelerate:
+            bev_feat = self.voxel_pooling_accelerated(rots, trans, intrins, post_rots, post_trans, volume)
+        else:
+            geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+            bev_feat = self.voxel_pooling(geom, volume)
+
+        if len(input) == 7:
+            return bev_feat, up_depth_digit #depth_digit
+        else:
+            return bev_feat, None
